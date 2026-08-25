@@ -17,11 +17,12 @@ import com.codewithaplus.appblocker.data.DailyUsage
 import com.codewithaplus.appblocker.data.isAccessibilityServiceEnabled
 import com.codewithaplus.appblocker.data.todayDateString
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import java.util.concurrent.Executors
 
 class ForegroundMonitorService : Service() {
 
@@ -61,7 +62,13 @@ class ForegroundMonitorService : Service() {
     }
 
     private lateinit var db: AppDatabase
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(1))
+
+    // A genuinely dedicated single OS thread, not a "view" over a shared elastic pool
+    // (Dispatchers.IO.limitedParallelism(1) is supposed to guarantee the same mutual exclusion,
+    // but proved hard to verify empirically under real device load with many concurrent
+    // accessibility events; this removes any ambiguity about the underlying primitive).
+    private val singleThreadExecutor = Executors.newSingleThreadExecutor()
+    private val scope = CoroutineScope(SupervisorJob() + singleThreadExecutor.asCoroutineDispatcher())
 
     private var currentTrackedPackage: String? = null
     private var lastPersistedAtMs: Long = 0L
@@ -95,13 +102,20 @@ class ForegroundMonitorService : Service() {
         stopTicker()
         instance = null
         scope.cancel()
+        singleThreadExecutor.shutdown()
         super.onDestroy()
     }
 
     private fun handleForegroundChange(packageName: String, timestampMs: Long) {
-        if (packageName == currentTrackedPackage) return
-
+        // The "already tracking this package" check must happen on the same confined
+        // dispatcher thread that mutates currentTrackedPackage. This is called from the
+        // Accessibility Service's main-thread callback, so checking the field here (before
+        // launching) reads it unsynchronized against the coroutine that writes it — a real
+        // data race that let duplicate transition events slip through, each spinning up a
+        // fresh periodic ticker without fully retiring the last one. Since the DB write is
+        // additive, every leaked ticker just kept stacking extra seconds on top indefinitely.
         scope.launch {
+            if (packageName == currentTrackedPackage) return@launch
             flushElapsed(timestampMs)
             stopTicker()
 
