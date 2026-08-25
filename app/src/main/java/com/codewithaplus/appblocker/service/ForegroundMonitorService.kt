@@ -160,7 +160,11 @@ class ForegroundMonitorService : Service() {
         val today = todayDateString()
         ensureTodayRow(pkg)
         db.dailyUsageDao().addSeconds(pkg, today, elapsedSeconds)
-        lastPersistedAtMs = nowMs
+        // Advance by only the whole seconds actually persisted, not all the way to `nowMs` —
+        // otherwise the sub-second remainder is silently discarded on every single flush
+        // (integer truncation), which compounds into a systematic undercount over a session
+        // with many ticks. Carrying the remainder forward keeps the running total accurate.
+        lastPersistedAtMs += elapsedSeconds * 1000L
         Log.d(TAG, "Persisted ${elapsedSeconds}s for $pkg")
         checkLimitAndEnforce(pkg, today)
     }
