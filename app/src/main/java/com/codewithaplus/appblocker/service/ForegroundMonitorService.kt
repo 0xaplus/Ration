@@ -107,17 +107,29 @@ class ForegroundMonitorService : Service() {
     }
 
     private fun handleForegroundChange(packageName: String, timestampMs: Long) {
-        // The "already tracking this package" check must happen on the same confined
-        // dispatcher thread that mutates currentTrackedPackage. This is called from the
-        // Accessibility Service's main-thread callback, so checking the field here (before
-        // launching) reads it unsynchronized against the coroutine that writes it — a real
-        // data race that let duplicate transition events slip through, each spinning up a
-        // fresh periodic ticker without fully retiring the last one. Since the DB write is
-        // additive, every leaked ticker just kept stacking extra seconds on top indefinitely.
+        // "Single-threaded dispatcher" only guarantees one coroutine's code is actively
+        // running at any instant — it does NOT make a whole suspend-function call chain
+        // atomic. If this coroutine suspends (e.g. on a Room DB call) before it has updated
+        // currentTrackedPackage/lastPersistedAtMs, a second near-simultaneous event's
+        // coroutine can run its own guard check against the stale values and duplicate work
+        // (confirmed live: two "Started timing" logs 3ms apart for the same transition).
+        // Fix: claim the new state SYNCHRONOUSLY, before any suspension, using values
+        // captured up front — so a duplicate/interleaved event immediately sees the update.
         scope.launch {
             if (packageName == currentTrackedPackage) return@launch
-            flushElapsed(timestampMs)
+
+            val previousPackage = currentTrackedPackage
+            val previousStart = lastPersistedAtMs
+            currentTrackedPackage = packageName
+            lastPersistedAtMs = timestampMs
             stopTicker()
+
+            if (previousPackage != null) {
+                val elapsedSeconds = ((timestampMs - previousStart) / 1000L).toInt()
+                if (elapsedSeconds > 0) {
+                    persistSeconds(previousPackage, elapsedSeconds)
+                }
+            }
 
             val tracked = db.trackedAppDao().getByPackageName(packageName)
             if (tracked != null) {
@@ -125,16 +137,18 @@ class ForegroundMonitorService : Service() {
                 val usage = db.dailyUsageDao().getForPackageAndDate(packageName, todayDateString())
                 if (usage?.isLockedToday == true) {
                     Log.d(TAG, "Already locked, re-triggering lock: $packageName")
-                    currentTrackedPackage = null
+                    // A newer transition may have already superseded our claim while we were
+                    // suspended on the DB lookups above — only clear it if we're still current.
+                    if (currentTrackedPackage == packageName) currentTrackedPackage = null
                     LockActivity.launch(this@ForegroundMonitorService, packageName)
                 } else {
-                    currentTrackedPackage = packageName
-                    lastPersistedAtMs = timestampMs
-                    startTicker()
-                    Log.d(TAG, "Started timing: $packageName")
+                    if (currentTrackedPackage == packageName) {
+                        startTicker()
+                        Log.d(TAG, "Started timing: $packageName")
+                    }
                 }
             } else {
-                currentTrackedPackage = null
+                if (currentTrackedPackage == packageName) currentTrackedPackage = null
             }
         }
     }
@@ -143,7 +157,15 @@ class ForegroundMonitorService : Service() {
         tickerJob = scope.launch {
             while (true) {
                 kotlinx.coroutines.delay(PERSIST_INTERVAL_MS)
-                flushElapsed(System.currentTimeMillis())
+                val pkg = currentTrackedPackage ?: break
+                val nowMs = System.currentTimeMillis()
+                val elapsedSeconds = ((nowMs - lastPersistedAtMs) / 1000L).toInt()
+                if (elapsedSeconds <= 0) continue
+                // Advance synchronously, before the suspend DB write below, for the same
+                // interleaving reason as above; also carries the sub-second remainder forward
+                // instead of discarding it (avoids a systematic undercount over long sessions).
+                lastPersistedAtMs += elapsedSeconds * 1000L
+                persistSeconds(pkg, elapsedSeconds)
             }
         }
     }
@@ -153,19 +175,11 @@ class ForegroundMonitorService : Service() {
         tickerJob = null
     }
 
-    private suspend fun flushElapsed(nowMs: Long) {
-        val pkg = currentTrackedPackage ?: return
-        val elapsedSeconds = ((nowMs - lastPersistedAtMs) / 1000L).toInt()
-        if (elapsedSeconds <= 0) return
+    private suspend fun persistSeconds(pkg: String, seconds: Int) {
         val today = todayDateString()
         ensureTodayRow(pkg)
-        db.dailyUsageDao().addSeconds(pkg, today, elapsedSeconds)
-        // Advance by only the whole seconds actually persisted, not all the way to `nowMs` —
-        // otherwise the sub-second remainder is silently discarded on every single flush
-        // (integer truncation), which compounds into a systematic undercount over a session
-        // with many ticks. Carrying the remainder forward keeps the running total accurate.
-        lastPersistedAtMs += elapsedSeconds * 1000L
-        Log.d(TAG, "Persisted ${elapsedSeconds}s for $pkg")
+        db.dailyUsageDao().addSeconds(pkg, today, seconds)
+        Log.d(TAG, "Persisted ${seconds}s for $pkg")
         checkLimitAndEnforce(pkg, today)
     }
 
@@ -174,8 +188,10 @@ class ForegroundMonitorService : Service() {
         val usage = db.dailyUsageDao().getForPackageAndDate(pkg, today) ?: return
         if (!usage.isLockedToday && usage.secondsUsedToday >= tracked.dailyLimitSeconds) {
             db.dailyUsageDao().setLocked(pkg, today, true)
-            stopTicker()
-            currentTrackedPackage = null
+            if (currentTrackedPackage == pkg) {
+                stopTicker()
+                currentTrackedPackage = null
+            }
             Log.d(TAG, "Limit breached for $pkg (${usage.secondsUsedToday}s >= ${tracked.dailyLimitSeconds}s), locking")
             LockActivity.launch(this@ForegroundMonitorService, pkg)
         }
